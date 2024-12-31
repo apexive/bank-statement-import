@@ -77,7 +77,8 @@ class AccountJournal(models.Model):
     def write(self, vals):
         self._update_vals(vals)
         res = super().write(vals)
-        self._update_providers()
+        if vals.get("online_bank_statement_provider"):
+            self._update_providers()
         return res
 
     def _update_vals(self, vals):
@@ -94,3 +95,13 @@ class AccountJournal(models.Model):
         self.ensure_one()
         provider = self.online_bank_statement_provider_id
         return provider.action_online_bank_statements_pull_wizard()
+
+    def action_open_online_bank_statement_provider(self):
+        return {
+            "type": "ir.actions.act_window",
+            "name": "Statement Provider",
+            "view_mode": "form",
+            "res_model": "online.bank.statement.provider",
+            "res_id": self.online_bank_statement_provider_id.id,
+            "target": "current",
+        }

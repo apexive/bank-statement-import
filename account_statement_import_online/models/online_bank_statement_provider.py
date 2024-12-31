@@ -1,6 +1,7 @@
 # Copyright 2019-2020 Brainbean Apps (https://brainbeanapps.com)
 # Copyright 2019-2020 Dataplug (https://dataplug.io)
 # Copyright 2022-2023 Therp BV (https://therp.nl)
+# Copyright 2014 Tecnativa - Pedro M. Baeza
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl.html).
 
 import logging
@@ -25,6 +26,10 @@ class OnlineBankStatementProvider(models.Model):
 
     company_id = fields.Many2one(related="journal_id.company_id", store=True)
     active = fields.Boolean(default=True)
+    create_statement = fields.Boolean(
+        default=True,
+        help="Create statements for the downloaded transactions automatically or not.",
+    )
     name = fields.Char(compute="_compute_name", store=True)
     journal_id = fields.Many2one(
         comodel_name="account.journal",
@@ -75,11 +80,12 @@ class OnlineBankStatementProvider(models.Model):
     )
     statement_creation_mode = fields.Selection(
         selection=[
-            ("daily", "Daily statements"),
-            ("weekly", "Weekly statements"),
-            ("monthly", "Monthly statements"),
+            ("daily", "Day"),
+            ("weekly", "Week"),
+            ("monthly", "Month"),
         ],
         default="daily",
+        string="Transactions interval to obtain",
         required=True,
     )
     api_base = fields.Char()
@@ -106,10 +112,10 @@ class OnlineBankStatementProvider(models.Model):
         ),
     ]
 
-    @api.model
-    def create(self, vals):
+    @api.model_create_multi
+    def create(self, vals_list):
         """Set provider_id on journal after creation."""
-        records = super().create(vals)
+        records = super().create(vals_list)
         records._update_journals()
         return records
 
@@ -185,6 +191,8 @@ class OnlineBankStatementProvider(models.Model):
     def _pull(self, date_since, date_until):
         """Pull data for all providers within requested period."""
         is_scheduled = self.env.context.get("scheduled")
+        debug = self.env.context.get("account_statement_online_import_debug")
+        debug_data = []
         for provider in self:
             statement_date_since = provider._get_statement_date_since(date_since)
             while statement_date_since < date_until:
@@ -205,12 +213,16 @@ class OnlineBankStatementProvider(models.Model):
                         exception, statement_date_since, statement_date_until
                     )
                     break  # Continue with next provider.
-                provider._create_or_update_statement(
-                    data, statement_date_since, statement_date_until
-                )
+                if debug:
+                    debug_data += data
+                else:
+                    provider._create_or_update_statement(
+                        data, statement_date_since, statement_date_until
+                    )
                 statement_date_since = statement_date_until
             if is_scheduled:
                 provider._schedule_next_run()
+        return debug_data
 
     def _log_provider_exception(
         self, exception, statement_date_since, statement_date_until
@@ -291,6 +303,8 @@ class OnlineBankStatementProvider(models.Model):
         """Final creation of statement if new, else write."""
         AccountBankStatement = self.env["account.bank.statement"]
         is_scheduled = self.env.context.get("scheduled")
+        if not self.create_statement:
+            return self._online_create_statement_lines(statement_values)
         if is_scheduled:
             AccountBankStatement = AccountBankStatement.with_context(
                 tracking_disable=True,
@@ -311,6 +325,17 @@ class OnlineBankStatementProvider(models.Model):
         else:
             statement.write(statement_values)
         return statement
+
+    def _online_create_statement_lines(self, statement_values):
+        AccountBankStatementLine = self.env["account.bank.statement.line"]
+        is_scheduled = self.env.context.get("scheduled")
+        if is_scheduled:
+            AccountBankStatementLine = AccountBankStatementLine.with_context(
+                tracking_disable=True,
+            )
+        lines = [line[2] for line in statement_values.get("line_ids", [])]
+        AccountBankStatementLine.create(lines)
+        return self.env["account.bank.statement"]  # Return empty statement
 
     def _get_statement_filtered_lines(
         self,

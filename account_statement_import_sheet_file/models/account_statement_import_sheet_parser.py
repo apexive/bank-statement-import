@@ -4,6 +4,9 @@
 
 import itertools
 import logging
+import math
+import re
+from collections.abc import Iterable
 from datetime import datetime
 from decimal import Decimal
 from io import StringIO
@@ -82,8 +85,8 @@ class AccountStatementImportSheetParser(models.TransientModel):
             balance_end = last_line["balance"]
             data.update(
                 {
-                    "balance_start": float(balance_start),
-                    "balance_end_real": float(balance_end),
+                    "balance_start": balance_start,
+                    "balance_end_real": balance_end,
                 }
             )
         transactions = list(
@@ -97,7 +100,11 @@ class AccountStatementImportSheetParser(models.TransientModel):
 
     def _get_column_indexes(self, header, column_name, mapping):
         column_indexes = []
-        if mapping[column_name] and "," in mapping[column_name]:
+        if (
+            mapping[column_name]
+            and isinstance(mapping[column_name], Iterable)
+            and "," in mapping[column_name]
+        ):
             # We have to concatenate the values
             column_names_or_indexes = mapping[column_name].split(",")
         else:
@@ -181,6 +188,8 @@ class AccountStatementImportSheetParser(models.TransientModel):
             else:
                 [next(csv_or_xlsx) for _i in range(header_line)]
                 header = [value.strip() for value in next(csv_or_xlsx)]
+            if mapping.offset_column:
+                header = header[mapping.offset_column :]
 
         # NOTE no seria necesario debit_column y credit_column ya que tenemos los
         # respectivos campos related
@@ -219,7 +228,7 @@ class AccountStatementImportSheetParser(models.TransientModel):
         footer_line = numrows - mapping.footer_lines_skip_count
 
         if isinstance(csv_or_xlsx, tuple):
-            rows = range(mapping.header_lines_skip_count, footer_line)
+            rows = range(label_line, footer_line)
         else:
             rows = csv_or_xlsx
 
@@ -229,7 +238,7 @@ class AccountStatementImportSheetParser(models.TransientModel):
                 book = csv_or_xlsx[0]
                 sheet = csv_or_xlsx[1]
                 values = []
-                for col_index in range(0, sheet.row_len(row)):
+                for col_index in range(mapping.offset_column, sheet.row_len(row)):
                     cell_type = sheet.cell_type(row, col_index)
                     cell_value = sheet.cell_value(row, col_index)
                     if cell_type == xlrd.XL_CELL_DATE:
@@ -239,6 +248,8 @@ class AccountStatementImportSheetParser(models.TransientModel):
                 if index >= footer_line:
                     continue
                 values = list(row)
+            if mapping.skip_empty_lines and not any(values):
+                continue
 
             timestamp = self._get_values_from_column(
                 values, columns, "timestamp_column"
@@ -319,7 +330,6 @@ class AccountStatementImportSheetParser(models.TransientModel):
                 if columns["bank_account_column"]
                 else None
             )
-
             if currency != currency_code:
                 continue
 
@@ -332,17 +342,20 @@ class AccountStatementImportSheetParser(models.TransientModel):
                 balance = None
 
             if debit_credit is not None:
-                amount = amount.copy_abs()
+                amount = abs(amount)
                 if debit_credit == mapping.debit_value:
                     amount = -amount
 
             if original_amount:
-                original_amount = self._parse_decimal(
-                    original_amount, mapping
-                ).copy_sign(amount)
+                original_amount = math.copysign(
+                    self._parse_decimal(original_amount, mapping), amount
+                )
             else:
                 original_amount = 0.0
-
+            if mapping.amount_inverse_sign:
+                amount = -amount
+                original_amount = -original_amount
+                balance = -balance if balance is not None else balance
             line = {
                 "timestamp": timestamp,
                 "amount": amount,
@@ -366,7 +379,9 @@ class AccountStatementImportSheetParser(models.TransientModel):
                 line["bank_name"] = bank_name
             if bank_account is not None:
                 line["bank_account"] = bank_account
-            lines.append(line)
+
+            if line:
+                lines.append(line)
         return lines
 
     @api.model
@@ -450,11 +465,18 @@ class AccountStatementImportSheetParser(models.TransientModel):
     @api.model
     def _parse_decimal(self, value, mapping):
         if isinstance(value, Decimal):
-            return value
+            return float(value)
         elif isinstance(value, float):
-            return Decimal(value)
-        value = value or "0"
+            return value
         thousands, decimal = mapping._get_float_separators()
+        # Remove all characters except digits, thousands separator,
+        # decimal separator, and signs
+        value = (
+            re.sub(
+                r"[^\d\-+" + re.escape(thousands) + re.escape(decimal) + "]+", "", value
+            )
+            or "0"
+        )
         value = value.replace(thousands, "")
         value = value.replace(decimal, ".")
-        return Decimal(value)
+        return float(value)
